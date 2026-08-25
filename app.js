@@ -58,42 +58,94 @@ function applyRemoteCult(row){
 }
 async function fetchCultById(id){
   if(!supabaseClient||!id)return null;
-  const {data,error}=await supabaseClient.from('seara_cultos').select('*, tipo:seara_culto_tipos(slug,nome,logo_path,cor_principal)').eq('id',id).single();
+  const {data,error}=await supabaseClient.from('seara_cultos').select('*').eq('id',id).single();
   if(error){console.error('[MÍDIA] Falha ao buscar culto',error);return null;}
-  return data;
+  return await hydrateCult(data);
+}
+async function hydrateCult(row){
+  if(!row)return null;
+  let tipo=null;
+  if(row.tipo_slug){
+    const {data,error}=await supabaseClient.from('seara_culto_tipos').select('slug,nome,logo_path,cor_principal').eq('slug',row.tipo_slug).maybeSingle();
+    if(!error)tipo=data;
+  }
+  const {data:midias,error:mediaError}=await supabaseClient.from('seara_culto_midias').select('*').eq('culto_id',row.id).eq('ativo',true).order('ordem',{ascending:true});
+  if(mediaError)console.warn('[MÍDIA] Falha ao carregar mídias do culto',mediaError);
+  return {...row,tipo,midias:midias||[]};
 }
 async function syncRemoteCultos(){
   if(!supabaseClient)return;
-  const now=new Date().toISOString();
-  const {data,error}=await supabaseClient.from('seara_cultos').select('*, tipo:seara_culto_tipos(slug,nome,logo_path,cor_principal)').order('data_inicio',{ascending:true}).limit(50);
-  if(error){remoteStatus='error';console.error('[MÍDIA] Falha ao carregar cultos',error);return;}
-  const candidates=(data||[]).filter(c=>!['encerrado','cancelado'].includes(c.status));
-  const active=candidates.find(c=>c.status==='em_andamento')||candidates.find(c=>c.data_inicio&&c.data_inicio>=now)||candidates[0];
-  if(active) applyRemoteCult(active);
-  else remoteStatus='connected';
+  const {data,error}=await supabaseClient.from('seara_cultos').select('*').order('data_inicio',{ascending:true}).limit(100);
+  if(error){remoteStatus='error';console.error('[MÍDIA] Falha ao carregar cultos do SEARA CENTRAL',error);toast('Falha ao consultar os cultos do SEARA CENTRAL.');return;}
+  const rows=[];
+  for(const row of (data||[])) rows.push(await hydrateCult(row));
+  const candidates=rows.filter(c=>c && !['encerrado','cancelado'].includes(c.status));
+  const now=Date.now();
+  const active=candidates.find(c=>c.status==='em_andamento')
+    ||candidates.find(c=>c.data_inicio && new Date(c.data_inicio).getTime()>=now)
+    ||candidates.slice().sort((a,b)=>new Date(b.data_inicio||0)-new Date(a.data_inicio||0))[0];
+  if(active){applyRemoteCult(active);}
+  else {state.cult=null;state.sequence=[];state.current=0;save();remoteStatus='connected';}
+}
+async function processRemoteEvent(row){
+  if(!row || row.destino_app!=='seara-midia' || row.origem_app!=='seara-central')return;
+  const culto=await fetchCultById(row.culto_id);
+  if(culto){applyRemoteCult(culto);toast('Informação recebida do SEARA CENTRAL.');render('Modo Culto');}
 }
 function subscribeRemote(){
   if(!supabaseClient)return;
   if(realtimeChannel)supabaseClient.removeChannel(realtimeChannel);
   realtimeChannel=supabaseClient.channel('seara-midia-realtime')
-    .on('postgres_changes',{event:'INSERT',schema:'public',table:'seara_culto_eventos',filter:'destino_app=eq.seara-midia'},async payload=>{
-      const row=payload.new||{};
-      if(row.origem_app!=='seara-central')return;
-      const culto=await fetchCultById(row.culto_id);
-      if(culto){applyRemoteCult(culto);toast('Nova programação recebida do SEARA CENTRAL.');render('Modo Culto');}
+    .on('postgres_changes',{event:'INSERT',schema:'public',table:'seara_cultos'},async payload=>{
+      const row=await hydrateCult(payload.new);
+      if(row){applyRemoteCult(row);toast('Novo culto recebido do SEARA CENTRAL.');render('Início');}
     })
-    .on('postgres_changes',{event:'UPDATE',schema:'public',table:'seara_cultos'},payload=>{
-      const row=payload.new;
-      if(remoteCult?.id===row.id){
-        fetchCultById(row.id).then(c=>{if(c){applyRemoteCult(c);toast('Culto atualizado pelo SEARA CENTRAL.');render('Modo Culto');}});
-      }
+    .on('postgres_changes',{event:'UPDATE',schema:'public',table:'seara_cultos'},async payload=>{
+      const row=await hydrateCult(payload.new);
+      if(row){applyRemoteCult(row);toast('Culto atualizado pelo SEARA CENTRAL.');render('Modo Culto');}
     })
-    .subscribe(status=>{remoteStatus=status==='SUBSCRIBED'?'connected':status==='CHANNEL_ERROR'?'error':'connecting';});
+    .on('postgres_changes',{event:'DELETE',schema:'public',table:'seara_cultos'},async payload=>{
+      if(state.cult?.id===payload.old?.id){state.cult=null;state.sequence=[];state.current=0;save();toast('Culto removido do SEARA CENTRAL.');render('Início');}
+    })
+    .on('postgres_changes',{event:'INSERT',schema:'public',table:'seara_culto_eventos',filter:'destino_app=eq.seara-midia'},processRemoteEvent)
+    .on('postgres_changes',{event:'INSERT',schema:'public',table:'seara_culto_midias'},async payload=>{
+      if(state.cult?.id===payload.new?.culto_id){const row=await fetchCultById(payload.new.culto_id);if(row){applyRemoteCult(row);render('Modo Culto');}}
+    })
+    .subscribe(status=>{remoteStatus=status==='SUBSCRIBED'?'connected':status==='CHANNEL_ERROR'?'error':'connecting';if(status==='CHANNEL_ERROR')console.error('[MÍDIA] Realtime CHANNEL_ERROR');});
+}
+async function replayMissedEvents(){
+  if(!supabaseClient)return;
+  const {data,error}=await supabaseClient.from('seara_culto_eventos').select('*').eq('destino_app','seara-midia').eq('origem_app','seara-central').order('criado_em',{ascending:false}).limit(20);
+  if(error){console.warn('[MÍDIA] Não foi possível verificar eventos pendentes',error);return;}
+  for(const row of (data||[])){const c=await fetchCultById(row.culto_id);if(c && !['encerrado','cancelado'].includes(c.status)){applyRemoteCult(c);break;}}
 }
 async function initRemote(){
   if(!mediaSupabaseInit())return;
   await syncRemoteCultos();
+  await replayMissedEvents();
+  await loadRemoteMessages();
   subscribeRemote();
+  subscribeRemoteMessages();
+}
+async function loadRemoteMessages(){
+  if(!supabaseClient)return;
+  const {data,error}=await supabaseClient.from('seara_mensagens').select('*').or('origem_app.eq.seara-midia,destino_app.eq.seara-midia').order('criado_em',{ascending:true}).limit(100);
+  if(error){console.warn('[MÍDIA] Falha ao carregar mensagens',error);return;}
+  state.messages=(data||[]).map(m=>({id:m.id,text:m.mensagem,mine:m.origem_app==='seara-midia',at:m.criado_em,assunto:m.assunto,remetente:m.remetente_nome}));save();
+}
+function subscribeRemoteMessages(){
+  if(!supabaseClient)return;
+  supabaseClient.channel('seara-midia-mensagens')
+    .on('postgres_changes',{event:'INSERT',schema:'public',table:'seara_mensagens'},payload=>{
+      const m=payload.new||{};
+      if(m.origem_app!=='seara-midia'&&m.destino_app!=='seara-midia')return;
+      state.messages.push({id:m.id,text:m.mensagem,mine:m.origem_app==='seara-midia',at:m.criado_em,assunto:m.assunto,remetente:m.remetente_nome});save();
+      if(m.destino_app==='seara-midia'){toast(`Nova mensagem: ${m.assunto||'do SEARA CENTRAL'}`);if(document.querySelector('.chat-main'))chat();}
+    }).subscribe();
+}
+async function sendRemoteMessage(text){
+  const {error}=await supabaseClient.from('seara_mensagens').insert({origem_app:'seara-midia',destino_app:'seara-central',remetente_tipo:'equipe',remetente_nome:'Mídia Seara',assunto:state.cult?`Culto: ${state.cult.name}`:'Operação Mídia',mensagem:text.trim(),tipo:'operacional',culto_id:state.cult?.id||null});
+  if(error)throw error;
 }
 function setTheme(dark){state.theme=dark?'dark':'light';document.documentElement.dataset.theme=dark?'dark':'';document.querySelector('meta[name="theme-color"]').setAttribute('content',dark?'#0c0c0d':'#ffffff');save();}
 function layout(active){return `<div class="app"><aside class="sidebar" id="sidebar"><div class="brand"><img src="./assets/logo-midia.png" alt="Logo Mídia Seara"><div><strong>MÍDIA SEARA</strong><small>Operação visual do culto</small></div></div><nav class="nav">${modules.map(m=>`<button class="${m===active?'active':''}" data-nav="${esc(m)}">${esc(m)}</button>`).join('')}</nav><div class="sidebar-footer">Aplicativo operacional da Mídia.<br>O Modo Culto acompanha a sequência real recebida do SEARA CENTRAL e permite ajustes operacionais durante a celebração.</div></aside><main class="main"><header class="topbar"><div class="top-title"><button class="mobile-toggle" id="toggle">☰</button><div><h1>MÍDIA SEARA</h1><span>Assembleia de Deus • Cabo</span></div></div><div class="top-actions"><span class="badge ${state.cult?'live':'warn'}">${state.cult?'CULTO RECEBIDO':'SEM CULTO'}</span><span class="badge ${remoteStatus==='connected'?'live':remoteStatus==='error'?'warn':''}">${remoteStatus==='connected'?'CENTRAL CONECTADO':remoteStatus==='error'?'CENTRAL OFFLINE':'CONECTANDO...'}</span><button class="btn small" id="theme">${state.theme==='dark'?'☀ Claro':'☾ Escuro'}</button></div></header><section class="content" id="content"></section></main></div><div id="toast" class="toast"></div>`}
@@ -110,7 +162,7 @@ function move(i,d){const j=i+d;if(j<0||j>=state.sequence.length)return;[state.se
 function mediaLibrary(){const c=document.getElementById('content');c.innerHTML=`<div class="toolbar"><div><h2>Biblioteca de Mídia</h2><div class="muted">Recursos visuais e arquivos que podem ser exibidos durante o culto.</div></div><div class="toolbar-actions"><button class="btn primary" id="upload">Adicionar arquivo</button><button class="btn" id="url">Adicionar por URL</button></div></div><div class="card"><input id="file" type="file" accept="audio/*,video/*,image/*" hidden><div class="empty">${state.media.length?`${state.media.length} recurso(s) cadastrado(s). Selecione um recurso para reprodução.`:'Nenhuma mídia cadastrada.'}</div></div><div class="section"><div class="section-title"><h3>Recursos cadastrados</h3></div><div class="grid">${state.media.map((m,i)=>`<div class="card"><span class="badge">${esc(m.kind)}</span><h3>${esc(m.name)}</h3><div class="muted">${esc(m.source||'Arquivo local')}</div><div class="controls"><button class="btn small primary" data-play="${i}">Reproduzir</button><button class="btn small danger" data-md="${i}">Excluir</button></div></div>`).join('')}</div></div>`;document.getElementById('upload').onclick=()=>document.getElementById('file').click();document.getElementById('file').onchange=e=>{const f=e.target.files[0];if(!f)return;const reader=new FileReader();reader.onload=()=>{state.media.push({id:crypto.randomUUID(),name:f.name,kind:f.type.startsWith('video')?'VÍDEO':f.type.startsWith('audio')?'ÁUDIO':'IMAGEM',source:'Arquivo local',data:reader.result});save();mediaLibrary();toast('Arquivo adicionado.');};reader.readAsDataURL(f)};document.getElementById('url').onclick=()=>{modal(`<h3>Adicionar mídia por URL</h3><form id="urlForm" class="form"><div class="field"><label>Nome</label><input name="name" required></div><div class="field"><label>URL direta do arquivo</label><input name="url" type="url" placeholder="https://..." required></div><div><button type="button" class="btn" id="mc">Cancelar</button> <button class="btn primary">Adicionar</button></div></form>`);document.getElementById('mc').onclick=closeModal;document.getElementById('urlForm').onsubmit=e=>{e.preventDefault();const f=new FormData(e.target);const url=f.get('url');state.media.push({id:crypto.randomUUID(),name:f.get('name'),kind:/\.(mp4|webm|mov)(\?|$)/i.test(url)?'VÍDEO':'ÁUDIO',source:'URL',data:url});save();closeModal();mediaLibrary()}};c.querySelectorAll('[data-play]').forEach(b=>b.onclick=()=>player(state.media[+b.dataset.play]));c.querySelectorAll('[data-md]').forEach(b=>b.onclick=()=>{state.media.splice(+b.dataset.md,1);save();mediaLibrary()})}
 function player(m){modal(`<div class="modal-head"><h3>${esc(m.name)}</h3><button class="btn small" id="x">Fechar</button></div><div class="player"><div class="player-stage" id="stage"></div></div>`);document.getElementById('x').onclick=closeModal;const s=document.getElementById('stage');if(m.kind==='VÍDEO'){s.innerHTML=`<video src="${esc(m.data)}" controls autoplay playsinline></video>`}else if(m.kind==='ÁUDIO'){s.innerHTML=`<audio src="${esc(m.data)}" controls autoplay></audio>`}else{s.innerHTML=`<img src="${esc(m.data)}" alt="${esc(m.name)}" style="max-width:100%;max-height:55vh;object-fit:contain">`}}
 function mediaOverlay(){const extras=state.standaloneMedia;modal(`<h3>Mídia auxiliar</h3><p class="muted">A mídia auxiliar é exibida sem alterar a sequência da liturgia. Ela existe para uma necessidade operacional durante o culto.</p><div class="section"><div class="sequence-list">${extras.length?extras.map((m,i)=>`<div class="seq-item"><div><strong>${esc(m.name)}</strong><div class="seq-sub">${esc(m.kind)}</div></div><button class="btn small primary" data-aux="${i}">Abrir</button></div>`).join(''):'<div class="empty">Nenhuma mídia auxiliar cadastrada.</div>'}</div></div><div class="controls"><button class="btn" id="close">Fechar</button><button class="btn primary" id="addAux">Adicionar recurso</button></div>`);document.getElementById('close').onclick=closeModal;document.getElementById('addAux').onclick=()=>{closeModal();mediaLibrary()};document.querySelectorAll('[data-aux]').forEach(b=>b.onclick=()=>player(extras[+b.dataset.aux]))}
-function chat(){const c=document.getElementById('content');const msgs=state.messages;c.innerHTML=`<div class="toolbar"><div><h2>Comunicação com o Pastor</h2><div class="muted">Canal operacional para alterações, confirmações e observações durante o culto.</div></div><span class="badge blue">FUTURA INTEGRAÇÃO</span></div><div class="chat"><div class="chat-list"><h3>Conversas</h3><button class="chat-room active"><strong>Pastor / Direção</strong><small style="display:block;color:var(--muted);margin-top:3px">Alterações do culto</small></button><button class="chat-room"><strong>SEARA CENTRAL</strong><small style="display:block;color:var(--muted);margin-top:3px">Programação</small></button></div><div class="chat-main"><div class="chat-head"><strong>Pastor / Direção</strong><div class="muted">Mensagens ficam vinculadas à operação nesta etapa.</div></div><div class="messages">${msgs.length?msgs.map(m=>`<div class="msg ${m.mine?'mine':''}">${esc(m.text)}<small>${m.mine?'Mídia':'Pastor / Direção'} • ${new Date(m.at).toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'})}</small></div>`).join(''):`<div class="empty">Nenhuma mensagem ainda.<br>O canal será conectado ao SEARA CENTRAL na fase de integração.</div>`}</div><form class="chat-compose" id="chatForm"><input name="text" placeholder="Enviar observação ao pastor..." required><button class="btn primary">Enviar</button></form></div></div>`;document.getElementById('chatForm').onsubmit=e=>{e.preventDefault();const f=new FormData(e.target);state.messages.push({id:crypto.randomUUID(),text:f.get('text'),mine:true,at:new Date().toISOString()});save();chat();toast('Mensagem registrada localmente.')}}
+function chat(){const c=document.getElementById('content');const msgs=state.messages;c.innerHTML=`<div class="toolbar"><div><h2>Comunicação com o Pastor</h2><div class="muted">Canal direto entre a Mídia e o SEARA CENTRAL. O Pastor também poderá responder por aqui.</div></div><span class="badge ${remoteStatus==='connected'?'live':'warn'}">${remoteStatus==='connected'?'SUPABASE CONECTADO':'OFFLINE'}</span></div><div class="chat"><div class="chat-list"><h3>Conversas</h3><button class="chat-room active"><strong>Pastor / SEARA CENTRAL</strong><small style="display:block;color:var(--muted);margin-top:3px">Alterações, confirmações e observações</small></button></div><div class="chat-main"><div class="chat-head"><strong>Pastor / SEARA CENTRAL</strong><div class="muted">${state.cult?`Vinculado ao culto: ${esc(state.cult.name)}`:'Sem culto ativo'}</div></div><div class="messages">${msgs.length?msgs.map(m=>`<div class="msg ${m.mine?'mine':''}">${esc(m.text)}<small>${m.mine?'Mídia':esc(m.remetente||'Pastor / Direção')} • ${new Date(m.at).toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'})}</small></div>`).join(''):`<div class="empty">Nenhuma mensagem ainda.</div>`}</div><form class="chat-compose" id="chatForm"><input name="text" placeholder="Enviar observação ao pastor..." required><button class="btn primary">Enviar</button></form></div></div>`;document.getElementById('chatForm').onsubmit=async e=>{e.preventDefault();const f=new FormData(e.target);try{await sendRemoteMessage(f.get('text'));await loadRemoteMessages();chat();toast('Mensagem enviada ao SEARA CENTRAL.');}catch(error){console.error(error);toast(`Falha ao enviar: ${error.message||'verifique o Supabase'}`);}}}
 function historyPage(){const c=document.getElementById('content');c.innerHTML=`<div class="toolbar"><div><h2>Histórico operacional</h2><div class="muted">Registro das ações feitas pela Mídia nesta versão.</div></div></div>${state.log.length?`<div class="table-wrap"><table class="table"><thead><tr><th>Horário</th><th>Oportunidade</th><th>Tipo</th><th>Grupo</th><th>Status</th></tr></thead><tbody>${state.log.slice().reverse().map(x=>`<tr><td>${new Date(x.at).toLocaleString('pt-BR')}</td><td><strong>${esc(x.title)}</strong></td><td>${esc(x.type)}</td><td>${esc(x.group||'—')}</td><td><span class="badge live">${esc(x.status)}</span></td></tr>`).join('')}</tbody></table></div>`:'<div class="empty">Nenhuma ação registrada ainda.</div>'}`}
 function endCult(){if(!confirm('Encerrar o culto? A sequência e o histórico local serão preservados.'))return;if(state.cult){state.log.push({title:`Culto encerrado: ${state.cult.name}`,type:'CULTO',group:'Mídia',status:'ENCERRADO',at:new Date().toISOString()});}state.cult=null;state.sequence=[];state.current=0;save();render('Início');toast('Culto encerrado.')}
 function modal(body){closeModal();const o=document.createElement('div');o.className='overlay';o.id='overlay';o.innerHTML=`<div class="modal">${body}</div>`;document.body.appendChild(o)}
