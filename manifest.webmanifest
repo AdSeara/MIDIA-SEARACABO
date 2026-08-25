@@ -1,9 +1,12 @@
 {
-  "name": "Mídia Seara — AD Seara",
-  "short_name": "Mídia Seara",
-  "start_url": "./",
-  "display": "standalone",
-  "background_color": "#f7f7f5",
-  "theme_color": "#b68a2c",
-  "lang": "pt-BR"
+  "name":"Mídia Seara",
+  "short_name":"Mídia Seara",
+  "description":"Aplicativo operacional da Mídia da Assembleia de Deus Seara.",
+  "start_url":"./",
+  "scope":"./",
+  "display":"standalone",
+  "orientation":"any",
+  "background_color":"#ffffff",
+  "theme_color":"#ffffff",
+  "icons":[{"src":"./assets/logo-midia.png","sizes":"512x512","type":"image/png","purpose":"any maskable"}]
 }

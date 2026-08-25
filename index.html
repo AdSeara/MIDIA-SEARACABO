@@ -1,7 +1,18 @@
 <!doctype html>
-<html lang="pt-BR"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="theme-color" content="#2563eb"><link rel="manifest" href="./manifest.webmanifest">
-<link rel="stylesheet" href="./styles.css"><title>Mídia Seara — AD Seara</title></head>
-<body><div id="app"></div><script src="./app.js"></script>
-<script>if("serviceWorker" in navigator) navigator.serviceWorker.register("./sw.js");</script></body></html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#ffffff">
+<meta name="description" content="Mídia Seara — operação visual e acompanhamento do culto.">
+<link rel="manifest" href="./manifest.webmanifest">
+<link rel="icon" href="./assets/logo-midia.png">
+<link rel="stylesheet" href="./styles.css">
+<title>Mídia Seara</title>
+</head>
+<body>
+<div id="app"></div>
+<script src="./app.js"></script>
+<script>if('serviceWorker' in navigator){navigator.serviceWorker.register('./sw.js').catch(()=>{});}</script>
+</body>
+</html>
