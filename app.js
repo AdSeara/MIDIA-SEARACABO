@@ -1,4 +1,8 @@
-const STORE='seara_midia_v2';
+const STORE='seara_midia_v3';
+let supabaseClient=null;
+let realtimeChannel=null;
+let remoteCult=null;
+let remoteStatus='connecting';
 const DEFAULT={theme:'light',cult:null,sequence:[],current:0,media:[],messages:[],log:[],standaloneMedia:[],settings:{church:'Assembleia de Deus Seara — Cabo'}};
 let state=Object.assign({},DEFAULT,JSON.parse(localStorage.getItem(STORE)||'{}'));
 state.sequence=Array.isArray(state.sequence)?state.sequence:[]; state.messages=Array.isArray(state.messages)?state.messages:[]; state.media=Array.isArray(state.media)?state.media:[]; state.standaloneMedia=Array.isArray(state.standaloneMedia)?state.standaloneMedia:[];
@@ -7,8 +11,92 @@ const modules=['Início','Modo Culto','Programação','Biblioteca de Mídia','Co
 const esc=v=>String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]));
 function save(){localStorage.setItem(STORE,JSON.stringify(state));}
 function toast(msg){let el=document.getElementById('toast');if(!el)return;el.textContent=msg;el.classList.add('show');setTimeout(()=>el.classList.remove('show'),1800)}
+function mediaSupabaseInit(){
+  try{
+    if(!window.supabase?.createClient) throw new Error('Biblioteca Supabase não carregada.');
+    supabaseClient=window.supabase.createClient(SEARA_SUPABASE_CONFIG.url,SEARA_SUPABASE_CONFIG.publishableKey);
+    return true;
+  }catch(error){
+    remoteStatus='error';
+    console.error('[MÍDIA SEARA] Supabase indisponível',error);
+    return false;
+  }
+}
+function remoteCultToLocal(row){
+  const tipo=row?.tipo?.nome||row?.tipo_slug||'Culto';
+  const logo=row?.logo_path||row?.tipo?.logo_path||'';
+  const sequence=Array.isArray(row?.liturgia)?row.liturgia.map((o,i)=>({
+    id:o.id||crypto.randomUUID(),
+    position:i+1,
+    title:o.titulo||o.title||o.tipo||'Oportunidade',
+    type:o.tipo||o.type||'Outra atividade',
+    group:o.grupoId||o.grupo||'Sem grupo',
+    note:[o.descricao,o.musicaSolicitada].filter(Boolean).join(' • '),
+    status:o.status||'aguardando',
+    remote:true
+  })):[];
+  return {
+    id:row.id,
+    name:row.titulo||tipo,
+    type:tipo,
+    date:row.data_inicio?new Date(row.data_inicio).toLocaleString('pt-BR',{dateStyle:'short',timeStyle:'short'}):'—',
+    startedAt:row.data_inicio||new Date().toISOString(),
+    note:row.observacoes||'',
+    logo,
+    remote:true,
+    status:row.status,
+    version:row.versao||1
+  ,sequence};
+}
+function applyRemoteCult(row){
+  remoteCult=remoteCultToLocal(row);
+  state.cult=remoteCult;
+  state.sequence=remoteCult.sequence||[];
+  state.current=Math.max(0,Math.min(state.current,state.sequence.length-1));
+  remoteStatus='connected';
+  save();
+}
+async function fetchCultById(id){
+  if(!supabaseClient||!id)return null;
+  const {data,error}=await supabaseClient.from('seara_cultos').select('*, tipo:seara_culto_tipos(slug,nome,logo_path,cor_principal)').eq('id',id).single();
+  if(error){console.error('[MÍDIA] Falha ao buscar culto',error);return null;}
+  return data;
+}
+async function syncRemoteCultos(){
+  if(!supabaseClient)return;
+  const now=new Date().toISOString();
+  const {data,error}=await supabaseClient.from('seara_cultos').select('*, tipo:seara_culto_tipos(slug,nome,logo_path,cor_principal)').order('data_inicio',{ascending:true}).limit(50);
+  if(error){remoteStatus='error';console.error('[MÍDIA] Falha ao carregar cultos',error);return;}
+  const candidates=(data||[]).filter(c=>!['encerrado','cancelado'].includes(c.status));
+  const active=candidates.find(c=>c.status==='em_andamento')||candidates.find(c=>c.data_inicio&&c.data_inicio>=now)||candidates[0];
+  if(active) applyRemoteCult(active);
+  else remoteStatus='connected';
+}
+function subscribeRemote(){
+  if(!supabaseClient)return;
+  if(realtimeChannel)supabaseClient.removeChannel(realtimeChannel);
+  realtimeChannel=supabaseClient.channel('seara-midia-realtime')
+    .on('postgres_changes',{event:'INSERT',schema:'public',table:'seara_culto_eventos',filter:'destino_app=eq.seara-midia'},async payload=>{
+      const row=payload.new||{};
+      if(row.origem_app!=='seara-central')return;
+      const culto=await fetchCultById(row.culto_id);
+      if(culto){applyRemoteCult(culto);toast('Nova programação recebida do SEARA CENTRAL.');render('Modo Culto');}
+    })
+    .on('postgres_changes',{event:'UPDATE',schema:'public',table:'seara_cultos'},payload=>{
+      const row=payload.new;
+      if(remoteCult?.id===row.id){
+        fetchCultById(row.id).then(c=>{if(c){applyRemoteCult(c);toast('Culto atualizado pelo SEARA CENTRAL.');render('Modo Culto');}});
+      }
+    })
+    .subscribe(status=>{remoteStatus=status==='SUBSCRIBED'?'connected':status==='CHANNEL_ERROR'?'error':'connecting';});
+}
+async function initRemote(){
+  if(!mediaSupabaseInit())return;
+  await syncRemoteCultos();
+  subscribeRemote();
+}
 function setTheme(dark){state.theme=dark?'dark':'light';document.documentElement.dataset.theme=dark?'dark':'';document.querySelector('meta[name="theme-color"]').setAttribute('content',dark?'#0c0c0d':'#ffffff');save();}
-function layout(active){return `<div class="app"><aside class="sidebar" id="sidebar"><div class="brand"><img src="./assets/logo-midia.png" alt="Logo Mídia Seara"><div><strong>MÍDIA SEARA</strong><small>Operação visual do culto</small></div></div><nav class="nav">${modules.map(m=>`<button class="${m===active?'active':''}" data-nav="${esc(m)}">${esc(m)}</button>`).join('')}</nav><div class="sidebar-footer">Aplicativo operacional da Mídia.<br>O Modo Culto acompanha a sequência real recebida do SEARA CENTRAL e permite ajustes operacionais durante a celebração.</div></aside><main class="main"><header class="topbar"><div class="top-title"><button class="mobile-toggle" id="toggle">☰</button><div><h1>MÍDIA SEARA</h1><span>Assembleia de Deus • Cabo</span></div></div><div class="top-actions"><span class="badge ${state.cult?'live':'warn'}">${state.cult?'CULTO ATIVO':'SEM CULTO'}</span><button class="btn small" id="theme">${state.theme==='dark'?'☀ Claro':'☾ Escuro'}</button></div></header><section class="content" id="content"></section></main></div><div id="toast" class="toast"></div>`}
+function layout(active){return `<div class="app"><aside class="sidebar" id="sidebar"><div class="brand"><img src="./assets/logo-midia.png" alt="Logo Mídia Seara"><div><strong>MÍDIA SEARA</strong><small>Operação visual do culto</small></div></div><nav class="nav">${modules.map(m=>`<button class="${m===active?'active':''}" data-nav="${esc(m)}">${esc(m)}</button>`).join('')}</nav><div class="sidebar-footer">Aplicativo operacional da Mídia.<br>O Modo Culto acompanha a sequência real recebida do SEARA CENTRAL e permite ajustes operacionais durante a celebração.</div></aside><main class="main"><header class="topbar"><div class="top-title"><button class="mobile-toggle" id="toggle">☰</button><div><h1>MÍDIA SEARA</h1><span>Assembleia de Deus • Cabo</span></div></div><div class="top-actions"><span class="badge ${state.cult?'live':'warn'}">${state.cult?'CULTO RECEBIDO':'SEM CULTO'}</span><span class="badge ${remoteStatus==='connected'?'live':remoteStatus==='error'?'warn':''}">${remoteStatus==='connected'?'CENTRAL CONECTADO':remoteStatus==='error'?'CENTRAL OFFLINE':'CONECTANDO...'}</span><button class="btn small" id="theme">${state.theme==='dark'?'☀ Claro':'☾ Escuro'}</button></div></header><section class="content" id="content"></section></main></div><div id="toast" class="toast"></div>`}
 function render(active='Início'){root.innerHTML=layout(active);document.querySelectorAll('[data-nav]').forEach(b=>b.onclick=()=>{show(b.dataset.nav);document.getElementById('sidebar').classList.remove('open')});document.getElementById('toggle').onclick=()=>document.getElementById('sidebar').classList.toggle('open');document.getElementById('theme').onclick=()=>{setTheme(state.theme!=='dark');render(active)};setTheme(state.theme==='dark');show(active)}
 function show(m){if(m==='Início')home();else if(m==='Modo Culto')cultMode();else if(m==='Programação')program();else if(m==='Biblioteca de Mídia')mediaLibrary();else if(m==='Comunicação')chat();else historyPage();}
 function home(){const c=document.getElementById('content');c.innerHTML=`<div class="hero"><div class="hero-copy"><div class="badge blue">MÍDIA • OPERAÇÃO DO CULTO</div><h2>O centro visual da celebração.</h2><p>A Mídia acompanha a sequência real do culto, exibe conteúdos, recebe alterações do pastor e pode inserir recursos visuais sem quebrar a liturgia principal.</p><div class="controls"><button class="btn primary" id="start">${state.cult?'Abrir Modo Culto':'Iniciar culto'}</button><button class="btn" id="program">Abrir programação</button></div></div><img class="logo-hero" src="./assets/logo-midia.png" alt="Mídia Seara"></div><div class="grid"><div class="card"><h3>Culto atual</h3><div class="metric">${state.cult?esc(state.cult.name):'—'}</div><div class="muted">${state.cult?esc(state.cult.date):'Nenhum culto em andamento'}</div></div><div class="card"><h3>Agora</h3><div class="metric">${currentItem()?.position??'—'}</div><div class="muted">${currentItem()?.title||'Nenhuma oportunidade'}</div></div><div class="card"><h3>Sequência</h3><div class="metric">${state.sequence.length}</div><div class="muted">itens na programação atual</div></div><div class="card"><h3>Comunicação</h3><div class="metric">${state.messages.length}</div><div class="muted">mensagens registradas</div></div></div><div class="section"><div class="section-title"><h3>Responsabilidade da Mídia</h3></div><div class="card"><p class="muted">Durante o culto, a Mídia acompanha <strong>AGORA / PRÓXIMO / DEPOIS</strong>, exibe recursos visuais, registra alterações solicitadas pelo pastor e mantém a sequência operacional. Conteúdos adicionais podem ser colocados em uma fila auxiliar sem alterar a raiz da liturgia.</p></div></div>`;document.getElementById('start').onclick=()=>{if(!state.cult)openCult();else render('Modo Culto')};document.getElementById('program').onclick=()=>render('Programação')}
@@ -29,3 +117,4 @@ function modal(body){closeModal();const o=document.createElement('div');o.classN
 function closeModal(){document.getElementById('overlay')?.remove()}
 window.addEventListener('keydown',e=>{if(e.key==='Escape')closeModal();if(state.cult&&document.getElementById('content')&&document.querySelector('.now-card')){if(e.key==='ArrowRight'){state.current=Math.min(state.sequence.length-1,state.current+1);save();render('Modo Culto')}if(e.key==='ArrowLeft'){state.current=Math.max(0,state.current-1);save();render('Modo Culto')}}});
 setTheme(state.theme==='dark');render('Início');
+initRemote().then(()=>{render('Início');}).catch(error=>{console.error(error);remoteStatus='error';render('Início');});

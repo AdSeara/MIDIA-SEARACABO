@@ -20,9 +20,9 @@ Esta versão inicia o refinamento operacional da Mídia antes da integração co
 
 ## Importante
 
-A comunicação com SEARA CENTRAL, Pastor, Sonoplastia, Banda AD Seara e demais aplicativos ainda não está conectada nesta etapa. A interface já reserva esses pontos para a integração futura.
+A integração com o SEARA CENTRAL está ativa nesta versão. O aplicativo usa o mesmo projeto Supabase, recebe cultos publicados pelo Central, sincroniza a liturgia e escuta eventos em tempo real.
 
-Os dados desta versão são locais no navegador. O backend/Supabase e a sincronização entre repositórios serão implementados depois que os fluxos individuais estiverem validados.
+Os ajustes operacionais feitos pela Mídia continuam locais por enquanto, mas o culto oficial recebido do Central é mantido como referência remota.
 
 ## Estrutura
 
