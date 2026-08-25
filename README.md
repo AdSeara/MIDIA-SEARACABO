@@ -1,42 +1,74 @@
-# MÍDIA SEARA
+# MÍDIA SEARA — Core Integration 7.0
 
-Aplicativo independente da Mídia da Assembleia de Deus Seara — Cabo.
+## Regra operacional
 
-## Objetivo desta versão
+`SEARA CENTRAL` planeja.
 
-Esta versão inicia o refinamento operacional da Mídia antes da integração com os demais aplicativos.
+`MÍDIA SEARA` inicia, avança, volta e encerra.
 
-### Responsabilidades
-- acompanhar a sequência real do culto;
-- operar o Modo Culto com AGORA / PRÓXIMO / DEPOIS;
-- avançar e voltar na sequência;
-- inserir oportunidade durante o culto;
-- alterar a raiz da programação quando necessário;
-- reproduzir áudio, vídeo e imagem;
-- manter uma fila de mídia auxiliar sem alterar a sequência principal;
-- registrar observações e comunicação operacional;
-- preservar um histórico local das ações;
-- funcionar em modo claro por padrão, com modo escuro equivalente.
+`seara_culto_operacao` é a fonte oficial do estado operacional.
 
-## Importante
+A Mídia não usa `seara_cultos.current_index`, `operacao_atual` ou `operacao_estado` para determinar a posição do culto.
 
-A integração com o SEARA CENTRAL está ativa nesta versão. O aplicativo usa o mesmo projeto Supabase, recebe cultos publicados pelo Central, sincroniza a liturgia e escuta eventos em tempo real.
+## Bridge
 
-Os ajustes operacionais feitos pela Mídia continuam locais por enquanto, mas o culto oficial recebido do Central é mantido como referência remota.
+`seara-core-bridge.js` é a única camada da Mídia responsável por:
 
-## Estrutura
+- `ensureOperation()`
+- `getOperation()`
+- `setOperation()`
+- `publishEvent()`
+- `subscribeOperation()`
+- leitura do culto compartilhado
+- alteração da liturgia compartilhada
+- mídias compartilhadas
 
-- `index.html` — entrada da PWA
-- `styles.css` — identidade visual e responsividade
-- `app.js` — lógica da aplicação
-- `manifest.webmanifest` — instalação PWA
-- `sw.js` — cache/offline controlado
-- `assets/logo-midia.png` — logo oficial enviada para a Mídia
+A interface não escreve diretamente em `seara_culto_operacao` ou `seara_culto_eventos`.
 
-## Publicação
+## Concorrência
 
-Suba todos os arquivos na raiz do repositório GitHub e publique pelo GitHub Pages.
+Toda alteração operacional carrega `versaoEsperada`.
 
-## Próxima etapa recomendada
+Se outro dispositivo alterar a operação antes da gravação, a Mídia não sobrescreve o estado. O estado atual é recarregado e o operador recebe a mensagem:
 
-Validar visualmente e funcionalmente o Modo Culto e, depois, definir o contrato de dados que será usado na integração com o SEARA CENTRAL.
+> O estado do culto foi alterado por outro dispositivo. Atualizando...
+
+## Supabase
+
+Não execute migrations antigas desta pasta.
+
+Os arquivos SQL `006_operacao_bidirecional_whatsapp.sql` e `007_corrigir_schema_integracao.sql` pertencem ao modelo anterior baseado em `current_index` e não fazem parte desta entrega.
+
+A migration que criou `seara_culto_operacao` e as RPCs já foi executada no projeto Supabase existente, conforme o contrato fornecido.
+
+## Storage
+
+O upload utiliza o bucket `seara-media`. O aplicativo não cria bucket automaticamente.
+
+Se o bucket não existir, o sistema continuará permitindo URLs externas, mas upload físico de arquivos falhará de forma explícita.
+
+## Deploy
+
+1. Substitua o conteúdo do repositório pelo conteúdo desta versão.
+2. Commit/push.
+3. Aguarde o GitHub Pages.
+4. Faça `Ctrl+Shift+R`.
+5. Se necessário, DevTools → Application → Service Workers → Unregister.
+
+## Teste mínimo
+
+- Culto criado no Central aparece na Mídia.
+- Mídia inicia o culto.
+- `seara_culto_operacao.status` muda para `em_andamento`.
+- `oportunidade_atual_id` aponta para a primeira oportunidade.
+- Avançar altera `oportunidade_atual_id`.
+- Voltar restaura a oportunidade anterior.
+- Encerrar muda `status` para `encerrado`.
+- Central recebe todas essas alterações por Realtime.
+- Mídias adicionadas pelo Central aparecem na Mídia.
+- Mídias adicionadas pela Mídia aparecem no Central.
+- Chat continua persistente e em tempo real.
+
+## Observação sobre as RPCs
+
+Os ZIPs fornecidos não continham o SQL exato da migration operacional já executada. O bridge usa a assinatura contratual informada para `seara_ensure_culto_operacao()` e `seara_set_culto_operacao()` e possui fallback condicional seguro para o caso de o RPC não estar exposto pelo PostgREST.
